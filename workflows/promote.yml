@@ -3,38 +3,53 @@ on:
   workflow_call:
     inputs:
       version:
-        description: 'Version tag to promote (e.g. v1.4.0)'
         required: true
         type: string
       image:
-        description: 'Image name in Artifact Registry (e.g. ai-router)'
         required: true
         type: string
       registry:
-        description: 'Artifact Registry host (e.g. us-central1-docker.pkg.dev)'
         required: true
         type: string
       project:
-        description: 'GCP project ID'
         required: true
         type: string
       ar_repo:
-        description: 'Artifact Registry repo name'
         required: true
         type: string
       environment:
-        description: 'Target environment (uat or prod)'
         required: true
         type: string
 
 jobs:
   promote:
     runs-on: ubuntu-latest
-    environment: ${{ inputs.environment }}    # ← dynamic, triggers the right protection rule
     permissions:
       contents: read
       id-token: write
+
     steps:
+      - name: Check maintainer permission
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: context.actor,
+            });
+
+            const allowed = ['admin', 'maintain'];
+            if (!allowed.includes(data.permission)) {
+              core.setFailed(
+                `🚫 ${context.actor} has permission '${data.permission}'. ` +
+                `Only maintainers and admins can promote images.`
+              );
+            } else {
+              core.info(`✅ ${context.actor} is authorized (${data.permission})`);
+            }
+
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
@@ -63,4 +78,4 @@ jobs:
           echo "**Image:** ${{ inputs.image }}" >> $GITHUB_STEP_SUMMARY
           echo "**Version:** ${{ inputs.version }}" >> $GITHUB_STEP_SUMMARY
           echo "**Environment:** ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Tag pushed:** \`${{ inputs.environment }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Promoted by:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
