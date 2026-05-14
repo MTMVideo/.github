@@ -1,0 +1,80 @@
+name: Reusable — Promote Image
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      image:
+        required: true
+        type: string
+      registry:
+        required: true
+        type: string
+      project:
+        required: true
+        type: string
+      ar_repo:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Check maintainer permission
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: context.actor,
+            });
+            const allowed = ['admin', 'maintain'];
+            if (!allowed.includes(data.permission)) {
+              core.setFailed(
+                `🚫 ${context.actor} has permission '${data.permission}'. ` +
+                `Only maintainers and admins can promote images.`
+              );
+            } else {
+              core.info(`✅ ${context.actor} is authorized (${data.permission})`);
+            }
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.WIF_SERVICE_ACCOUNT }}
+
+      - name: Install crane
+        run: |
+          curl -sL https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_x86_64.tar.gz \
+            | tar -xz crane
+          sudo mv crane /usr/local/bin/
+
+      - name: Configure crane auth
+        run: gcloud auth configure-docker ${{ inputs.registry }} --quiet
+
+      - name: Retag image
+        run: |
+          SOURCE="${{ inputs.registry }}/${{ inputs.project }}/${{ inputs.ar_repo }}/${{ inputs.image }}:${{ inputs.version }}"
+          TARGET="${{ inputs.registry }}/${{ inputs.project }}/${{ inputs.ar_repo }}/${{ inputs.image }}:${{ inputs.environment }}"
+          echo "Promoting $SOURCE → $TARGET"
+          crane copy "$SOURCE" "$TARGET"
+
+      - name: Summary
+        run: |
+          echo "### Promotion Complete" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** ${{ inputs.image }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ inputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Promoted by:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
