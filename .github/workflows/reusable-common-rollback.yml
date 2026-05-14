@@ -1,4 +1,4 @@
-name: Reusable — Promote Image
+name: Reusable — Rollback Image
 on:
   workflow_call:
     inputs:
@@ -20,13 +20,9 @@ on:
       environment:
         required: true
         type: string
-      skip_uat_check:
-        required: false
-        type: boolean
-        default: false
 
 jobs:
-  promote:
+  rollback:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -48,7 +44,7 @@ jobs:
             if (!allowed.includes(data.permission)) {
               core.setFailed(
                 `🚫 ${context.actor} has permission '${data.permission}'. ` +
-                `Only maintainers and admins can promote images.`
+                `Only maintainers and admins can rollback images.`
               );
             } else {
               core.info(`✅ ${context.actor} is authorized (${data.permission})`);
@@ -69,44 +65,11 @@ jobs:
       - name: Configure crane auth
         run: gcloud auth configure-docker ${{ inputs.registry }} --quiet
 
-      - name: Verify version tag exists
-        run: |
-          if ! crane digest \
-            ${{ inputs.registry }}/${{ inputs.project }}/${{ inputs.ar_repo }}/${{ inputs.image }}:${{ inputs.version }} > /dev/null 2>&1; then
-            echo "❌ Version ${{ inputs.version }} not found in registry"
-            exit 1
-          fi
-          echo "✅ Version ${{ inputs.version }} exists"
-
-      - name: Verify UAT deployed before prod
-        if: inputs.environment == 'prod' && inputs.skip_uat_check != true
-        run: |
-          VERSION_DIGEST=$(crane digest \
-            ${{ inputs.registry }}/${{ inputs.project }}/${{ inputs.ar_repo }}/${{ inputs.image }}:${{ inputs.version }})
-
-          UAT_DIGEST=$(crane digest \
-            ${{ inputs.registry }}/${{ inputs.project }}/${{ inputs.ar_repo }}/${{ inputs.image }}:uat 2>/dev/null || echo "NOT_FOUND")
-
-          echo "Version digest: $VERSION_DIGEST"
-          echo "UAT digest:     $UAT_DIGEST"
-
-          if [ "$UAT_DIGEST" = "NOT_FOUND" ]; then
-            echo "❌ UAT tag does not exist. Deploy to UAT first."
-            exit 1
-          fi
-
-          if [ "$VERSION_DIGEST" != "$UAT_DIGEST" ]; then
-            echo "❌ UAT is running a different version. Promote ${{ inputs.version }} to UAT first."
-            exit 1
-          fi
-
-          echo "✅ UAT is running ${{ inputs.version }}. Safe to promote to prod."
-
       - name: Retag image
         run: |
           SOURCE="${{ inputs.registry }}/${{ inputs.project }}/${{ inputs.ar_repo }}/${{ inputs.image }}:${{ inputs.version }}"
           TARGET="${{ inputs.registry }}/${{ inputs.project }}/${{ inputs.ar_repo }}/${{ inputs.image }}:${{ inputs.environment }}"
-          echo "Promoting $SOURCE → $TARGET"
+          echo "Rolling back ${{ inputs.environment }} → ${{ inputs.version }}"
           crane copy "$SOURCE" "$TARGET"
 
       - name: Create audit log
@@ -114,29 +77,24 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const skippedUat = '${{ inputs.skip_uat_check }}' === 'true';
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `🚀 ${context.actor} promoted ${{ inputs.version }} to ${{ inputs.environment }}`,
+              title: `⏪ ${context.actor} rolled back ${{ inputs.environment }} to ${{ inputs.version }}`,
               body: [
-                `**Promoted by:** ${context.actor}`,
+                `**Rolled back by:** ${context.actor}`,
                 `**Version:** ${{ inputs.version }}`,
                 `**Environment:** ${{ inputs.environment }}`,
                 `**Status:** ✅ Success`,
-                skippedUat ? '**⚠️ UAT check was skipped**' : '',
                 `**Run:** ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-              ].filter(Boolean).join('\n'),
-              labels: ['deployment'],
+              ].join('\n'),
+              labels: ['deployment', 'rollback'],
             });
 
       - name: Summary
         run: |
-          echo "### Promotion Complete ✅" >> $GITHUB_STEP_SUMMARY
+          echo "### Rollback Complete ✅" >> $GITHUB_STEP_SUMMARY
           echo "**Image:** ${{ inputs.image }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Version:** ${{ inputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Rolled back to:** ${{ inputs.version }}" >> $GITHUB_STEP_SUMMARY
           echo "**Environment:** ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Promoted by:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ inputs.skip_uat_check }}" = "true" ]; then
-            echo "**⚠️ UAT check was skipped**" >> $GITHUB_STEP_SUMMARY
-          fi
+          echo "**Rolled back by:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
