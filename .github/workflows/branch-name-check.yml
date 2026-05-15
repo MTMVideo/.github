@@ -1,0 +1,30 @@
+name: Reusable — Branch name check
+
+on:
+  workflow_call:
+
+jobs:
+  branch-name-check:
+    name: Branch name check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate branch name
+        env:
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          # Allowed: feature/<TICKET-ID>-short-description
+          #          fix/<TICKET-ID>-short-description
+          #          hotfix/<TICKET-ID>-short-description
+          # Ticket id is uppercase letters + digits separated by a dash
+          # (e.g. MTM-1234, AI-42).
+          PATTERN='^(feature|fix|hotfix)/[A-Z]+-[0-9]+-[a-z0-9._-]+$'
+          if [[ ! "$BRANCH" =~ $PATTERN ]]; then
+            echo "❌ Branch '$BRANCH' does not match $PATTERN"
+            echo ""
+            echo "Examples of valid names:"
+            echo "  feature/MTM-1234-add-retry-logic"
+            echo "  fix/MTM-9876-timeout-handling"
+            echo "  hotfix/MTM-555-prod-token-refresh"
+            exit 1
+          fi
+          echo "✅ Branch '$BRANCH' is valid"
