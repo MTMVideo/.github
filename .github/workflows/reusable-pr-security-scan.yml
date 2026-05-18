@@ -1,0 +1,54 @@
+name: Reusable — PR security scan
+
+on:
+  workflow_call:
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+
+jobs:
+  security-scan:
+    name: Security scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Claude
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          model: claude-sonnet-4-6
+          prompt: |
+            You are a security reviewer for the MTMVideo organization.
+            Read the diff (`git diff origin/${{ github.base_ref }}...HEAD`) and
+            scan ONLY the added/modified lines for these specific issues:
+
+            1. Hardcoded secrets: API keys, tokens, passwords, private keys,
+               connection strings with credentials. Flag suspicious-looking
+               long strings even if not obvious secrets.
+            2. New dependencies (package.json, requirements.txt, go.mod, etc.) —
+               flag unfamiliar packages, especially typo-squatting candidates.
+            3. Auth/permission changes — modifications to middleware, RBAC,
+               IAM bindings, route guards, JWT handling, session logic.
+            4. Insecure patterns — SQL string concatenation, unescaped shell
+               commands, eval() on user input, disabled TLS verification,
+               weak crypto (MD5/SHA1 for security purposes).
+
+            Post a single PR comment. If you find issues, list each one with:
+            - file:line
+            - what's wrong
+            - severity (high/medium/low)
+            - suggested fix
+
+            If you find nothing, post exactly: "No security issues found in
+            this diff." Don't speculate or flag low-confidence guesses — only
+            flag things you'd stake a reviewer's time on.
+
+            Do NOT comment on code style, performance, or general quality —
+            only the four categories above.
