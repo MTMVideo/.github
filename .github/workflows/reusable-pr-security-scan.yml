@@ -14,6 +14,7 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
+      id-token: write    # required for the action's OIDC-based GitHub App token
     steps:
       - uses: actions/checkout@v4
         with:
@@ -24,7 +25,7 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           model: claude-sonnet-4-6
-          prompt: |
+          direct_prompt: |
             You are a security reviewer for the MTMVideo organization.
             Read the diff (`git diff origin/${{ github.base_ref }}...HEAD`) and
             scan ONLY the added/modified lines for these specific issues:
