@@ -1,4 +1,4 @@
-name: Reusable — PR security scan
+name: Reusable — PR review (description + security)
 
 on:
   workflow_call:
@@ -7,20 +7,47 @@ on:
         required: true
 
 jobs:
-  security-scan:
-    name: Security scan
+  review:
+    name: PR description + security scan
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: write
       issues: write
-      id-token: write    # required for the action's OIDC-based GitHub App token
+      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Run Claude
+      - name: PR description
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          model: claude-sonnet-4-6
+          direct_prompt: |
+            You are reviewing a pull request in the MTMVideo organization.
+            Read the diff (`git diff origin/${{ github.base_ref }}...HEAD`) and the
+            commit messages (`git log origin/${{ github.base_ref }}...HEAD --format='%s%n%b'`).
+
+            Post a single PR comment with three sections:
+
+            **What changed** — a 2-4 bullet summary of the actual code changes
+            (not the commit subjects verbatim — describe the behavior change).
+
+            **Why** — one short paragraph inferring intent from commit messages,
+            branch name, and code context. If unclear, say so.
+
+            **Risk areas** — bullet points of things a reviewer should look at
+            carefully: touched auth/permissions, schema changes, retry/timeout
+            logic, anything in a critical path. If nothing risky, write "None
+            identified — straightforward change."
+
+            Keep it under 200 words total. Don't repeat the diff. Don't fabricate
+            context that isn't in the code or commits.
+
+      - name: Security scan
         uses: anthropics/claude-code-action@beta
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
