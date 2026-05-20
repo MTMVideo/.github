@@ -141,7 +141,7 @@ jobs:
             echo ""
             echo '```bash'
             echo "git tag $next_version"
-            echo "git push origin $next_version"
+            echo "git push --tags"
             echo '```'
             echo ""
 
