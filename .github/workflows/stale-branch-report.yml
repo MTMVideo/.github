@@ -13,17 +13,19 @@ jobs:
   report:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Collect stale branches across org
-        id: collect
         env:
           GH_TOKEN: ${{ secrets.ORG_READ_TOKEN }}
         run: |
           set -euo pipefail
           THRESHOLD=$(date -u -d '30 days ago' +%s)
-          OUTPUT="stale.txt"
-          : > "$OUTPUT"
+          : > stale.txt
 
-          for repo in $(gh repo list MTMVideo --limit 200 --json name --jq '.[].name'); do
+          # --source excludes forks; --no-archived excludes archived repos.
+          # Without these, ancient OSS forks get flagged for stale `master`.
+          for repo in $(gh repo list MTMVideo --limit 200 --source --no-archived --json name --jq '.[].name'); do
             gh api "/repos/MTMVideo/$repo/branches?per_page=100" --paginate \
               --jq '.[] | select(.name != "main" and (.name | startswith("studio-") | not)) | .name' \
             | while read -r branch; do
@@ -32,12 +34,14 @@ jobs:
               commit_ts=$(date -u -d "$commit_iso" +%s)
               if [ "$commit_ts" -lt "$THRESHOLD" ]; then
                 age_days=$(( ($(date -u +%s) - commit_ts) / 86400 ))
-                echo "$repo,$branch,$age_days" >> "$OUTPUT"
+                echo "$repo,$branch,$age_days" >> stale.txt
               fi
             done
           done
 
-      - name: Summarise with Claude
+          echo "Found $(wc -l < stale.txt) stale branches"
+
+      - name: Format report with Claude
         uses: anthropics/claude-code-action@beta
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -45,16 +49,40 @@ jobs:
           mode: agent
           model: claude-haiku-4-5
           direct_prompt: |
-            Read stale.txt. Each line is `repo,branch,age_days`. Group by repo,
-            sort within each repo by age descending. Write a markdown summary
-            for a GitHub issue titled "Weekly stale branch report — <today>".
+            Read stale.txt. Each line is `repo,branch,age_days`. Group by repo
+            (alphabetical), sort within each repo by age descending.
 
-            Format:
-            ## <repo>
-            - `<branch>` — <age> days old
+            Write the markdown to a file at ./report.md with this exact format:
 
-            If nothing is stale, write "All branches are fresh — no action
-            needed." Don't editorialise. Don't suggest deletions; the team
-            decides what to clean up.
+              _Last updated: <ISO timestamp>_
 
-            Then open a GitHub issue in MTMVideo/.github with the summary.
+              ## <repo>
+              - `<branch>` — <age> days old
+
+            Repeat the `## <repo>` block for each repo. If stale.txt is empty,
+            write only:
+
+              _Last updated: <ISO timestamp>_
+
+              All branches are fresh — no action needed.
+
+            Don't editorialise. Don't suggest deletions. Don't create or edit
+            any GitHub issues — a later step handles posting.
+
+      - name: Post or update rolling issue
+        env:
+          GH_TOKEN: ${{ secrets.ORG_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          TITLE="Stale branch tracker"
+          REPO="MTMVideo/.github"
+
+          existing=$(gh issue list --repo "$REPO" --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number // empty')
+
+          if [ -n "$existing" ]; then
+            echo "Updating issue #$existing"
+            gh issue edit "$existing" --repo "$REPO" --body-file report.md
+          else
+            echo "Creating new issue"
+            gh issue create --repo "$REPO" --title "$TITLE" --body-file report.md
+          fi
