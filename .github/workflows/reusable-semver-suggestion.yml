@@ -1,0 +1,94 @@
+name: Reusable — Semver suggestion
+
+on:
+  workflow_call:
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+
+jobs:
+  suggest:
+    name: Suggest next semver
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need full history for tag + log
+
+      - name: Compute commit log since last tag
+        id: log
+        run: |
+          set -euo pipefail
+          last_tag=$(git describe --tags --abbrev=0 --match 'v*.*.*' 2>/dev/null || echo "")
+          echo "last_tag=${last_tag:-(none)}" >> "$GITHUB_OUTPUT"
+
+          if [ -z "$last_tag" ]; then
+            range="HEAD"
+            count=$(git rev-list --count HEAD)
+          else
+            range="$last_tag..HEAD"
+            count=$(git rev-list --count "$last_tag..HEAD")
+          fi
+          echo "range=$range" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+          # Write commit log to a file for Claude to read. Use --format with
+          # subject+body so BREAKING CHANGE footers are visible.
+          git log "$range" --format='--- %h%n%s%n%b' > commits.txt
+          echo "Wrote $(wc -l < commits.txt) lines of commit data."
+
+      - name: Suggest next version
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          mode: agent
+          model: claude-sonnet-4-6
+          direct_prompt: |
+            You are suggesting the next semver tag for ${{ github.repository }}.
+
+            Read commits.txt. Each commit is preceded by `--- <short-sha>`,
+            then the commit subject, then the optional body.
+
+            Previous tag: ${{ steps.log.outputs.last_tag }}
+            Commits since: ${{ steps.log.outputs.count }}
+
+            Apply standard Conventional Commits semver rules to the commits:
+            - Any `BREAKING CHANGE:` footer or `!` after the type (e.g. `feat!:`) → MAJOR bump
+            - Any `feat:` without breaking change → MINOR bump
+            - Only `fix:`, `chore:`, `docs:`, `ci:`, `refactor:`, `test:`, `perf:`, `style:` → PATCH bump
+            - Commits that don't follow Conventional Commits → PATCH (and flag this)
+
+            If the previous tag is "(none)", suggest `v0.1.0` as the first release.
+
+            Write the result to $GITHUB_STEP_SUMMARY (use the `echo "..." >>
+            "$GITHUB_STEP_SUMMARY"` pattern) with this format:
+
+              ## Suggested version: **vX.Y.Z**
+
+              **Previous:** ${{ steps.log.outputs.last_tag }}
+              **Commits analysed:** ${{ steps.log.outputs.count }}
+              **Bump type:** MAJOR / MINOR / PATCH (pick one)
+
+              **Why:** one sentence pointing to the specific commit(s) that
+              drove the bump decision. Reference the short SHA.
+
+              **To tag:**
+              ```bash
+              git tag vX.Y.Z
+              git push origin vX.Y.Z
+              ```
+
+              <details>
+              <summary>Commits considered (${{ steps.log.outputs.count }})</summary>
+
+              <one bullet per commit, format: `- <subject> (<sha>)`>
+
+              </details>
+
+            Don't post a PR comment. Don't create a tag. Don't open an issue.
+            This is advisory output only — the developer reads the summary
+            and runs the tag command manually.
