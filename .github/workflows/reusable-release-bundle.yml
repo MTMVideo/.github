@@ -1,0 +1,261 @@
+name: Reusable — Release bundle (notes + changelog + deployment checklist)
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+
+jobs:
+  bundle:
+    name: Build release bundle
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # create release, push changelog branch
+      pull-requests: write  # open changelog PR
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve previous tag and commit range
+        id: ctx
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag }}"
+          prev=$(git describe --tags --abbrev=0 --match 'v*.*.*' "${tag}^" 2>/dev/null || echo "")
+          if [ -z "$prev" ]; then
+            range="$tag"
+            prev_display="(initial release)"
+          else
+            range="${prev}..${tag}"
+            prev_display="$prev"
+          fi
+          today=$(date -u +%Y-%m-%d)
+
+          echo "tag=$tag"            >> "$GITHUB_OUTPUT"
+          echo "prev=$prev"          >> "$GITHUB_OUTPUT"
+          echo "prev_display=$prev_display" >> "$GITHUB_OUTPUT"
+          echo "range=$range"        >> "$GITHUB_OUTPUT"
+          echo "today=$today"        >> "$GITHUB_OUTPUT"
+
+      # ────────────────────────────────────────────────────────────────
+      # 1. Release notes — bash classifier → draft GitHub release
+      # ────────────────────────────────────────────────────────────────
+      - name: Generate release notes
+        id: notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          range="${{ steps.ctx.outputs.range }}"
+          tag="${{ steps.ctx.outputs.tag }}"
+          prev="${{ steps.ctx.outputs.prev_display }}"
+
+          breaking=$(mktemp); feat=$(mktemp); fix=$(mktemp)
+          chore=$(mktemp);   docs=$(mktemp); other=$(mktemp)
+
+          while IFS=$'\t' read -r sha subject body; do
+            [ -z "$sha" ] && continue
+            full="$subject"$'\n'"$body"
+
+            # Strip the type prefix from the subject for cleaner display.
+            clean=$(printf '%s' "$subject" | sed -E 's/^[a-zA-Z]+(\([^)]+\))?!?: *//')
+
+            if printf '%s' "$full" | grep -qE '^[a-zA-Z]+(\([^)]+\))?!:' \
+              || printf '%s' "$full" | grep -qiE 'BREAKING CHANGE:'; then
+              echo "- $clean ($sha)" >> "$breaking"
+            elif printf '%s' "$subject" | grep -qE '^feat(\([^)]+\))?:'; then
+              echo "- $clean ($sha)" >> "$feat"
+            elif printf '%s' "$subject" | grep -qE '^fix(\([^)]+\))?:'; then
+              echo "- $clean ($sha)" >> "$fix"
+            elif printf '%s' "$subject" | grep -qE '^docs(\([^)]+\))?:'; then
+              echo "- $clean ($sha)" >> "$docs"
+            elif printf '%s' "$subject" | grep -qE '^(chore|ci|refactor|test|perf|style|build|revert)(\([^)]+\))?:'; then
+              echo "- $clean ($sha)" >> "$chore"
+            else
+              echo "- $subject ($sha)" >> "$other"
+            fi
+          done < <(git log "$range" --format='%h%x09%s%x09%b' 2>/dev/null || true)
+
+          notes=$(mktemp)
+          {
+            echo "## Changes since $prev"
+            echo ""
+            [ -s "$breaking" ] && { echo "### 💥 Breaking changes"; cat "$breaking"; echo ""; }
+            [ -s "$feat" ]     && { echo "### 🚀 Features";          cat "$feat"; echo ""; }
+            [ -s "$fix" ]      && { echo "### 🐛 Fixes";              cat "$fix"; echo ""; }
+            [ -s "$docs" ]     && { echo "### 📝 Docs";               cat "$docs"; echo ""; }
+            [ -s "$chore" ]    && { echo "<details><summary>🔧 Internal</summary>"; echo ""; cat "$chore"; echo ""; echo "</details>"; echo ""; }
+            [ -s "$other" ]    && { echo "### ⚠️ Non-Conventional-Commit subjects"; cat "$other"; echo ""; }
+          } > "$notes"
+
+          echo "Generated notes:"
+          cat "$notes"
+
+          # Create the release as a DRAFT — PO reviews + publishes manually.
+          gh release create "$tag" --draft --title "$tag" --notes-file "$notes"
+          echo "notes_path=$notes" >> "$GITHUB_OUTPUT"
+
+      # ────────────────────────────────────────────────────────────────
+      # 2. Changelog — bash generator → branch + PR
+      # ────────────────────────────────────────────────────────────────
+      - name: Update CHANGELOG.md and open PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.ctx.outputs.tag }}"
+          today="${{ steps.ctx.outputs.today }}"
+          range="${{ steps.ctx.outputs.range }}"
+
+          # Collect into Keep-a-Changelog buckets.
+          added=$(mktemp); changed=$(mktemp); fixed=$(mktemp); removed=$(mktemp); breaking=$(mktemp)
+
+          while IFS=$'\t' read -r sha subject body; do
+            [ -z "$sha" ] && continue
+            full="$subject"$'\n'"$body"
+            clean=$(printf '%s' "$subject" | sed -E 's/^[a-zA-Z]+(\([^)]+\))?!?: *//')
+
+            if printf '%s' "$full" | grep -qE '^[a-zA-Z]+(\([^)]+\))?!:' \
+              || printf '%s' "$full" | grep -qiE 'BREAKING CHANGE:'; then
+              echo "- $clean" >> "$breaking"
+            elif printf '%s' "$subject" | grep -qE '^feat(\([^)]+\))?:'; then
+              echo "- $clean" >> "$added"
+            elif printf '%s' "$subject" | grep -qE '^fix(\([^)]+\))?:'; then
+              echo "- $clean" >> "$fixed"
+            elif printf '%s' "$subject" | grep -qE '^refactor(\([^)]+\))?:'; then
+              echo "- $clean" >> "$changed"
+            elif printf '%s' "$subject" | grep -qE '^revert(\([^)]+\))?:'; then
+              echo "- $clean" >> "$removed"
+            fi
+          done < <(git log "$range" --format='%h%x09%s%x09%b' 2>/dev/null || true)
+
+          # Build new section (skip empty subsections).
+          section=$(mktemp)
+          {
+            echo "## [$tag] - $today"
+            echo ""
+            [ -s "$breaking" ] && { echo "### Breaking changes"; cat "$breaking"; echo ""; }
+            [ -s "$added" ]    && { echo "### Added";            cat "$added";    echo ""; }
+            [ -s "$changed" ]  && { echo "### Changed";          cat "$changed";  echo ""; }
+            [ -s "$fixed" ]    && { echo "### Fixed";            cat "$fixed";    echo ""; }
+            [ -s "$removed" ]  && { echo "### Removed";          cat "$removed";  echo ""; }
+          } > "$section"
+
+          # If section has no buckets at all, just stamp a note.
+          if [ "$(wc -l < "$section")" -lt 3 ]; then
+            {
+              echo "## [$tag] - $today"
+              echo ""
+              echo "_No notable changes._"
+              echo ""
+            } > "$section"
+          fi
+
+          # Prepend section to CHANGELOG.md (create with header if missing).
+          if [ ! -f CHANGELOG.md ]; then
+            {
+              echo "# Changelog"
+              echo ""
+              echo "All notable changes to this project will be documented in this file."
+              echo "Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)."
+              echo ""
+            } > CHANGELOG.md
+          fi
+
+          new_changelog=$(mktemp)
+          {
+            head -n 4 CHANGELOG.md   # preserve the header block
+            echo ""
+            cat "$section"
+            tail -n +5 CHANGELOG.md  # everything after the header
+          } > "$new_changelog"
+          mv "$new_changelog" CHANGELOG.md
+
+          # Commit on a fresh branch and open a PR.
+          branch="chore/changelog-${tag}"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name  "github-actions[bot]"
+          git checkout -b "$branch"
+          git add CHANGELOG.md
+          git commit -m "chore: update CHANGELOG for ${tag}"
+          git push -u origin "$branch"
+
+          gh pr create \
+            --base main \
+            --head "$branch" \
+            --title "chore: update CHANGELOG for ${tag}" \
+            --body "Auto-generated changelog entry for [\`${tag}\`](../../releases/tag/${tag}).
+
+Please review and merge."
+
+      # ────────────────────────────────────────────────────────────────
+      # 3. Deployment checklist — direct Anthropic API → append to release
+      # ────────────────────────────────────────────────────────────────
+      - name: Generate deployment checklist
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          range="${{ steps.ctx.outputs.range }}"
+          tag="${{ steps.ctx.outputs.tag }}"
+
+          diff_file=$(mktemp)
+          git diff "$range" > "$diff_file" || true
+
+          # Cap the diff at 200 KB so we don't blow the context window on
+          # huge releases. The first 200 KB usually covers the signals we
+          # care about (config, migrations, deps).
+          if [ "$(wc -c < "$diff_file")" -gt 200000 ]; then
+            head -c 200000 "$diff_file" > "${diff_file}.trim"
+            mv "${diff_file}.trim" "$diff_file"
+            echo "(diff was truncated to 200 KB)"
+          fi
+
+          prompt_payload=$(mktemp)
+          jq -n \
+            --arg model "claude-sonnet-4-6" \
+            --arg tag "$tag" \
+            --arg diff "$(cat "$diff_file")" \
+            '{
+              model: $model,
+              max_tokens: 2048,
+              messages: [{
+                role: "user",
+                content: ("You are reviewing a release diff for ${{ github.repository }} at tag " + $tag + ". Identify manual actions required before promoting this release to UAT or Production. Scan ONLY for:\n\n1. New environment variables (added to .env.example, config files, Dockerfile ENV, k8s manifests, helm values)\n2. Schema migrations (new files in migrations/, alembic/, *.sql, prisma/migrations/)\n3. Secrets that need creation or rotation\n4. Config changes (helm values, k8s configmaps, app config) that need to be applied in target environments\n5. New external dependencies that need infra (new redis, new bucket, new SA, new IAM binding)\n\nOutput STRICT format, no preamble:\n\n## Pre-promotion checklist\n- [ ] <action item> (file:line)\n\nIf nothing requires manual action, output exactly:\n\n## Pre-promotion checklist\n✅ No manual actions required.\n\nDo NOT comment on code quality, performance, or anything not in the five categories above.\n\n--- DIFF ---\n" + $diff)
+              }]
+            }' > "$prompt_payload"
+
+          response=$(mktemp)
+          http_code=$(curl -sS -o "$response" -w '%{http_code}' \
+            https://api.anthropic.com/v1/messages \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            --data-binary "@$prompt_payload")
+
+          if [ "$http_code" != "200" ]; then
+            echo "::warning::Anthropic API returned $http_code — skipping deployment checklist"
+            cat "$response"
+            exit 0
+          fi
+
+          checklist=$(jq -r '.content[0].text' < "$response")
+
+          # Append checklist to existing release body.
+          existing_body=$(gh release view "$tag" --json body --jq '.body')
+          combined=$(mktemp)
+          {
+            printf '%s\n\n' "$existing_body"
+            printf '%s\n' "$checklist"
+          } > "$combined"
+          gh release edit "$tag" --notes-file "$combined"
+
+          echo "Checklist appended to release $tag."
