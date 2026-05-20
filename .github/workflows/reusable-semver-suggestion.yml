@@ -2,6 +2,9 @@ name: Reusable — Semver suggestion
 
 on:
   workflow_call:
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
 
 jobs:
   suggest:
@@ -14,118 +17,102 @@ jobs:
         with:
           fetch-depth: 0   # need full history for tag + log
 
-      - name: Compute next version
+      - name: Compute next version (bash plumbing + Haiku classifier)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           set -euo pipefail
 
+          # ── 1. Resolve last tag + commit range ────────────────────────
           last_tag=$(git describe --tags --abbrev=0 --match 'v*.*.*' 2>/dev/null || echo "")
-
           if [ -z "$last_tag" ]; then
             range="HEAD"
             prev_display="(none — no v*.*.* tag found)"
-            major=0
-            minor=0
-            patch=0
+            major=0; minor=0; patch=0
             first_release=1
           else
             range="$last_tag..HEAD"
             prev_display="$last_tag"
-            # Strip the leading v and split into M.m.p
             IFS='.' read -r major minor patch <<< "${last_tag#v}"
             first_release=0
           fi
 
-          # Pull commit subjects + bodies for analysis. Each commit is one
-          # null-delimited block so multi-line bodies (BREAKING CHANGE
-          # footers) stay attached to their subject.
-          mapfile -d '' -t COMMITS < <(git log "$range" --format='%s%n%b%x00' 2>/dev/null || true)
-          count=${#COMMITS[@]}
+          commits_file=$(mktemp)
+          git log "$range" --format='%h|%s|%b%x00' > "$commits_file" 2>/dev/null || true
+          count=$(grep -c '' "$commits_file" 2>/dev/null || echo 0)
 
-          # Classify each commit. Track the highest bump type seen.
-          # 3 = major, 2 = minor, 1 = patch, 0 = none.
-          highest=0
-          breaking_shas=()
-          feat_shas=()
-          fix_shas=()
-          chore_shas=()
-          unknown_shas=()
-
-          # Re-walk commits to also collect short SHAs alongside subjects.
-          while IFS=$'\t' read -r sha subject body; do
-            [ -z "$sha" ] && continue
-            full="$subject"$'\n'"$body"
-
-            # MAJOR: BREAKING CHANGE footer OR `!` after type (e.g. feat!:, fix!:)
-            if printf '%s' "$full" | grep -qE '^[a-zA-Z]+(\([^)]+\))?!:' \
-              || printf '%s' "$full" | grep -qiE 'BREAKING CHANGE:'; then
-              highest=3
-              breaking_shas+=("$sha $subject")
-              continue
-            fi
-
-            # MINOR: feat: or feat(scope):
-            if printf '%s' "$subject" | grep -qE '^feat(\([^)]+\))?:'; then
-              [ "$highest" -lt 2 ] && highest=2
-              feat_shas+=("$sha $subject")
-              continue
-            fi
-
-            # PATCH: fix, chore, ci, docs, refactor, test, perf, style, build, revert
-            if printf '%s' "$subject" | grep -qE '^(fix|chore|ci|docs|refactor|test|perf|style|build|revert)(\([^)]+\))?:'; then
-              [ "$highest" -lt 1 ] && highest=1
-              # Bucket fixes separately for clearer reporting.
-              if printf '%s' "$subject" | grep -qE '^fix(\([^)]+\))?:'; then
-                fix_shas+=("$sha $subject")
-              else
-                chore_shas+=("$sha $subject")
-              fi
-              continue
-            fi
-
-            # Anything else — non-Conventional Commits. Treat as patch but flag.
-            [ "$highest" -lt 1 ] && highest=1
-            unknown_shas+=("$sha $subject")
-          done < <(git log "$range" --format='%h%x09%s%x09%b' 2>/dev/null || true)
-
-          # Decide next version.
+          # ── 2. Short-circuit edge cases without calling Claude ────────
           if [ "$first_release" -eq 1 ]; then
-            bump_label="FIRST RELEASE"
             next_version="v0.1.0"
+            bump_label="FIRST RELEASE"
             why="No previous tag found — suggesting v0.1.0 as the first release."
           elif [ "$count" -eq 0 ]; then
-            bump_label="NO CHANGE"
             next_version="$last_tag"
+            bump_label="NO CHANGE"
             why="No commits since $last_tag — nothing to release."
           else
-            case "$highest" in
-              3)
-                bump_label="MAJOR"
-                next_version="v$((major + 1)).0.0"
-                why="Breaking change detected in: ${breaking_shas[0]}"
-                ;;
-              2)
-                bump_label="MINOR"
-                next_version="v${major}.$((minor + 1)).0"
-                why="New feature(s) detected, no breaking changes. First feat: ${feat_shas[0]}"
-                ;;
-              1)
-                bump_label="PATCH"
-                next_version="v${major}.${minor}.$((patch + 1))"
-                if [ "${#unknown_shas[@]}" -gt 0 ] && [ "${#fix_shas[@]}" -eq 0 ] && [ "${#chore_shas[@]}" -eq 0 ]; then
-                  why="Only non-Conventional-Commit subjects found — defaulting to PATCH. Consider rewriting commit messages to follow the standard."
-                else
-                  why="Only fixes / chores / docs / etc. — no new features or breaking changes."
-                fi
-                ;;
-              *)
-                bump_label="PATCH"
-                next_version="v${major}.${minor}.$((patch + 1))"
-                why="Could not classify commits; defaulting to PATCH."
-                ;;
+            # ── 3. Call Haiku to classify ────────────────────────────────
+            # Build a compact prompt. Strict JSON-only response keeps the
+            # output tiny (~200 tokens) and the parsing reliable.
+            payload=$(mktemp)
+            jq -n \
+              --arg model "claude-haiku-4-5" \
+              --arg last_tag "$last_tag" \
+              --arg commits "$(cat "$commits_file")" \
+              '{
+                model: $model,
+                max_tokens: 512,
+                messages: [{
+                  role: "user",
+                  content: (
+                    "You are suggesting the next semver bump for a release.\n\n" +
+                    "Previous tag: " + $last_tag + "\n\n" +
+                    "Commits since (one per line, format `sha|subject|body`, blocks separated by NUL):\n" +
+                    $commits + "\n\n" +
+                    "Apply Conventional Commits semver rules:\n" +
+                    "- `BREAKING CHANGE:` footer OR `!` after type (e.g. `feat!:`) → MAJOR\n" +
+                    "- `feat:` without breaking → MINOR\n" +
+                    "- `fix:`, `chore:`, `ci:`, `docs:`, `refactor:`, `test:`, `perf:`, `style:`, `build:`, `revert:` → PATCH\n" +
+                    "- Commits not matching Conventional Commits format → infer intent from the subject and classify as MAJOR/MINOR/PATCH, but mention this in the rationale.\n\n" +
+                    "Return STRICT JSON only (no markdown, no preamble), this exact shape:\n" +
+                    "{\"bump\": \"MAJOR|MINOR|PATCH\", \"why\": \"one short sentence pointing at the specific commit(s) that drove the decision; reference the short SHA\"}\n"
+                  )
+                }]
+              }' > "$payload"
+
+            response=$(mktemp)
+            http_code=$(curl -sS -o "$response" -w '%{http_code}' \
+              https://api.anthropic.com/v1/messages \
+              -H "x-api-key: $ANTHROPIC_API_KEY" \
+              -H "anthropic-version: 2023-06-01" \
+              -H "content-type: application/json" \
+              --data-binary "@$payload")
+
+            if [ "$http_code" != "200" ]; then
+              echo "::warning::Anthropic API returned $http_code — falling back to PATCH"
+              cat "$response"
+              bump_label="PATCH"
+              why="Claude API unavailable ($http_code); defaulted to PATCH."
+            else
+              text=$(jq -r '.content[0].text' < "$response")
+              bump_label=$(printf '%s' "$text" | jq -r '.bump' 2>/dev/null || echo "PATCH")
+              why=$(printf '%s' "$text" | jq -r '.why' 2>/dev/null || echo "Could not parse Claude response.")
+              # Sanity check — accept only the three valid values.
+              case "$bump_label" in
+                MAJOR|MINOR|PATCH) ;;
+                *) bump_label="PATCH"; why="Unexpected bump value from Claude — defaulted to PATCH." ;;
+              esac
+            fi
+
+            # ── 4. Apply the bump ────────────────────────────────────────
+            case "$bump_label" in
+              MAJOR) next_version="v$((major + 1)).0.0" ;;
+              MINOR) next_version="v${major}.$((minor + 1)).0" ;;
+              PATCH) next_version="v${major}.${minor}.$((patch + 1))" ;;
             esac
           fi
 
-          # Write the step summary.
+          # ── 5. Step summary ──────────────────────────────────────────
           {
             echo "## Suggested version: \`$next_version\`"
             echo ""
@@ -144,39 +131,13 @@ jobs:
             echo "git push --tags"
             echo '```'
             echo ""
-
-            if [ "${#breaking_shas[@]}" -gt 0 ]; then
-              echo "### 💥 Breaking changes (${#breaking_shas[@]})"
-              for entry in "${breaking_shas[@]}"; do echo "- $entry"; done
+            if [ "$count" -gt 0 ]; then
+              echo "<details><summary>Commits considered ($count)</summary>"
               echo ""
-            fi
-            if [ "${#feat_shas[@]}" -gt 0 ]; then
-              echo "### ✨ Features (${#feat_shas[@]})"
-              for entry in "${feat_shas[@]}"; do echo "- $entry"; done
-              echo ""
-            fi
-            if [ "${#fix_shas[@]}" -gt 0 ]; then
-              echo "### 🐛 Fixes (${#fix_shas[@]})"
-              for entry in "${fix_shas[@]}"; do echo "- $entry"; done
-              echo ""
-            fi
-            if [ "${#chore_shas[@]}" -gt 0 ]; then
-              echo "<details><summary>🔧 Internal (${#chore_shas[@]})</summary>"
-              echo ""
-              for entry in "${chore_shas[@]}"; do echo "- $entry"; done
+              git log "$range" --format='- %h %s' 2>/dev/null || true
               echo ""
               echo "</details>"
-              echo ""
-            fi
-            if [ "${#unknown_shas[@]}" -gt 0 ]; then
-              echo "<details><summary>⚠️ Non-Conventional-Commit subjects (${#unknown_shas[@]})</summary>"
-              echo ""
-              for entry in "${unknown_shas[@]}"; do echo "- $entry"; done
-              echo ""
-              echo "</details>"
-              echo ""
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # Also log to stdout for the run log.
-          echo "Suggested: $next_version  (bump: $bump_label, $count commits since $prev_display)"
+          echo "Suggested: $next_version (bump: $bump_label, $count commits since $prev_display)"
