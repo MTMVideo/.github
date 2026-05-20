@@ -4,6 +4,20 @@ on:
   schedule:
     - cron: '0 9 * * MON'   # Mondays 09:00 UTC
   workflow_dispatch:
+    inputs:
+      delete_stale_branches:
+        description: 'Delete the stale branches after reporting? Default is no (report only).'
+        type: choice
+        required: true
+        default: 'no'
+        options:
+          - 'no'
+          - 'yes'
+      confirm_text:
+        description: 'Required when deleting: type YES-DELETE exactly to confirm. Leave blank for report-only runs.'
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -120,6 +134,48 @@ jobs:
               { print "- `" $2 "` — " $3 " days old" }
             '
           } > report.md
+
+      - name: Delete stale branches (gated)
+        if: github.event_name == 'workflow_dispatch' && inputs.delete_stale_branches == 'yes'
+        env:
+          # Requires PAT with Contents: Write across all managed repos.
+          # Without write permission this step 403s — that's intentional;
+          # widening to write is an explicit decision.
+          GH_TOKEN: ${{ secrets.ORG_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ "${{ inputs.confirm_text }}" != "YES-DELETE" ]; then
+            echo "::error::delete_stale_branches=yes but confirm_text is not 'YES-DELETE'. Aborting."
+            echo "Re-run the workflow with confirm_text set to YES-DELETE exactly."
+            exit 1
+          fi
+
+          if [ ! -s stale.txt ]; then
+            echo "stale.txt is empty — nothing to delete."
+            exit 0
+          fi
+
+          echo "::warning::Deleting $(wc -l < stale.txt) branches across managed repos."
+          deleted=0
+          failed=0
+          while IFS=, read -r repo branch age_days; do
+            [ -z "$repo" ] && continue
+            # URL-encode the branch name (handles slashes etc.)
+            ref="refs/heads/$branch"
+            if gh api -X DELETE "/repos/MTMVideo/$repo/git/$ref" 2>/dev/null; then
+              echo "  ✓ deleted $repo / $branch ($age_days days)"
+              deleted=$((deleted + 1))
+            else
+              echo "  ✗ failed   $repo / $branch ($age_days days)"
+              failed=$((failed + 1))
+            fi
+          done < stale.txt
+
+          echo ""
+          echo "Deleted: $deleted"
+          echo "Failed:  $failed"
+          [ "$failed" -gt 0 ] && exit 1 || true
 
       - name: Post or update rolling issue
         env:
