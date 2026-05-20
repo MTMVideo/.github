@@ -2,9 +2,6 @@ name: Reusable — Semver suggestion
 
 on:
   workflow_call:
-    secrets:
-      ANTHROPIC_API_KEY:
-        required: true
 
 jobs:
   suggest:
@@ -12,83 +9,174 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0   # need full history for tag + log
 
-      - name: Compute commit log since last tag
-        id: log
+      - name: Compute next version
         run: |
           set -euo pipefail
+
           last_tag=$(git describe --tags --abbrev=0 --match 'v*.*.*' 2>/dev/null || echo "")
-          echo "last_tag=${last_tag:-(none)}" >> "$GITHUB_OUTPUT"
 
           if [ -z "$last_tag" ]; then
             range="HEAD"
-            count=$(git rev-list --count HEAD)
+            prev_display="(none — no v*.*.* tag found)"
+            major=0
+            minor=0
+            patch=0
+            first_release=1
           else
             range="$last_tag..HEAD"
-            count=$(git rev-list --count "$last_tag..HEAD")
+            prev_display="$last_tag"
+            # Strip the leading v and split into M.m.p
+            IFS='.' read -r major minor patch <<< "${last_tag#v}"
+            first_release=0
           fi
-          echo "range=$range" >> "$GITHUB_OUTPUT"
-          echo "count=$count" >> "$GITHUB_OUTPUT"
 
-          # Write commit log to a file for Claude to read. Use --format with
-          # subject+body so BREAKING CHANGE footers are visible.
-          git log "$range" --format='--- %h%n%s%n%b' > commits.txt
-          echo "Wrote $(wc -l < commits.txt) lines of commit data."
+          # Pull commit subjects + bodies for analysis. Each commit is one
+          # null-delimited block so multi-line bodies (BREAKING CHANGE
+          # footers) stay attached to their subject.
+          mapfile -d '' -t COMMITS < <(git log "$range" --format='%s%n%b%x00' 2>/dev/null || true)
+          count=${#COMMITS[@]}
 
-      - name: Suggest next version
-        uses: anthropics/claude-code-action@beta
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          mode: agent
-          model: claude-sonnet-4-6
-          direct_prompt: |
-            You are suggesting the next semver tag for ${{ github.repository }}.
+          # Classify each commit. Track the highest bump type seen.
+          # 3 = major, 2 = minor, 1 = patch, 0 = none.
+          highest=0
+          breaking_shas=()
+          feat_shas=()
+          fix_shas=()
+          chore_shas=()
+          unknown_shas=()
 
-            Read commits.txt. Each commit is preceded by `--- <short-sha>`,
-            then the commit subject, then the optional body.
+          # Re-walk commits to also collect short SHAs alongside subjects.
+          while IFS=$'\t' read -r sha subject body; do
+            [ -z "$sha" ] && continue
+            full="$subject"$'\n'"$body"
 
-            Previous tag: ${{ steps.log.outputs.last_tag }}
-            Commits since: ${{ steps.log.outputs.count }}
+            # MAJOR: BREAKING CHANGE footer OR `!` after type (e.g. feat!:, fix!:)
+            if printf '%s' "$full" | grep -qE '^[a-zA-Z]+(\([^)]+\))?!:' \
+              || printf '%s' "$full" | grep -qiE 'BREAKING CHANGE:'; then
+              highest=3
+              breaking_shas+=("$sha $subject")
+              continue
+            fi
 
-            Apply standard Conventional Commits semver rules to the commits:
-            - Any `BREAKING CHANGE:` footer or `!` after the type (e.g. `feat!:`) → MAJOR bump
-            - Any `feat:` without breaking change → MINOR bump
-            - Only `fix:`, `chore:`, `docs:`, `ci:`, `refactor:`, `test:`, `perf:`, `style:` → PATCH bump
-            - Commits that don't follow Conventional Commits → PATCH (and flag this)
+            # MINOR: feat: or feat(scope):
+            if printf '%s' "$subject" | grep -qE '^feat(\([^)]+\))?:'; then
+              [ "$highest" -lt 2 ] && highest=2
+              feat_shas+=("$sha $subject")
+              continue
+            fi
 
-            If the previous tag is "(none)", suggest `v0.1.0` as the first release.
+            # PATCH: fix, chore, ci, docs, refactor, test, perf, style, build, revert
+            if printf '%s' "$subject" | grep -qE '^(fix|chore|ci|docs|refactor|test|perf|style|build|revert)(\([^)]+\))?:'; then
+              [ "$highest" -lt 1 ] && highest=1
+              # Bucket fixes separately for clearer reporting.
+              if printf '%s' "$subject" | grep -qE '^fix(\([^)]+\))?:'; then
+                fix_shas+=("$sha $subject")
+              else
+                chore_shas+=("$sha $subject")
+              fi
+              continue
+            fi
 
-            Write the result to $GITHUB_STEP_SUMMARY (use the `echo "..." >>
-            "$GITHUB_STEP_SUMMARY"` pattern) with this format:
+            # Anything else — non-Conventional Commits. Treat as patch but flag.
+            [ "$highest" -lt 1 ] && highest=1
+            unknown_shas+=("$sha $subject")
+          done < <(git log "$range" --format='%h%x09%s%x09%b' 2>/dev/null || true)
 
-              ## Suggested version: **vX.Y.Z**
+          # Decide next version.
+          if [ "$first_release" -eq 1 ]; then
+            bump_label="FIRST RELEASE"
+            next_version="v0.1.0"
+            why="No previous tag found — suggesting v0.1.0 as the first release."
+          elif [ "$count" -eq 0 ]; then
+            bump_label="NO CHANGE"
+            next_version="$last_tag"
+            why="No commits since $last_tag — nothing to release."
+          else
+            case "$highest" in
+              3)
+                bump_label="MAJOR"
+                next_version="v$((major + 1)).0.0"
+                why="Breaking change detected in: ${breaking_shas[0]}"
+                ;;
+              2)
+                bump_label="MINOR"
+                next_version="v${major}.$((minor + 1)).0"
+                why="New feature(s) detected, no breaking changes. First feat: ${feat_shas[0]}"
+                ;;
+              1)
+                bump_label="PATCH"
+                next_version="v${major}.${minor}.$((patch + 1))"
+                if [ "${#unknown_shas[@]}" -gt 0 ] && [ "${#fix_shas[@]}" -eq 0 ] && [ "${#chore_shas[@]}" -eq 0 ]; then
+                  why="Only non-Conventional-Commit subjects found — defaulting to PATCH. Consider rewriting commit messages to follow the standard."
+                else
+                  why="Only fixes / chores / docs / etc. — no new features or breaking changes."
+                fi
+                ;;
+              *)
+                bump_label="PATCH"
+                next_version="v${major}.${minor}.$((patch + 1))"
+                why="Could not classify commits; defaulting to PATCH."
+                ;;
+            esac
+          fi
 
-              **Previous:** ${{ steps.log.outputs.last_tag }}
-              **Commits analysed:** ${{ steps.log.outputs.count }}
-              **Bump type:** MAJOR / MINOR / PATCH (pick one)
+          # Write the step summary.
+          {
+            echo "## Suggested version: \`$next_version\`"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Previous tag | \`$prev_display\` |"
+            echo "| Commits analysed | $count |"
+            echo "| Bump type | **$bump_label** |"
+            echo ""
+            echo "**Why:** $why"
+            echo ""
+            echo "### To tag and release"
+            echo ""
+            echo '```bash'
+            echo "git tag $next_version"
+            echo "git push origin $next_version"
+            echo '```'
+            echo ""
 
-              **Why:** one sentence pointing to the specific commit(s) that
-              drove the bump decision. Reference the short SHA.
+            if [ "${#breaking_shas[@]}" -gt 0 ]; then
+              echo "### 💥 Breaking changes (${#breaking_shas[@]})"
+              for entry in "${breaking_shas[@]}"; do echo "- $entry"; done
+              echo ""
+            fi
+            if [ "${#feat_shas[@]}" -gt 0 ]; then
+              echo "### ✨ Features (${#feat_shas[@]})"
+              for entry in "${feat_shas[@]}"; do echo "- $entry"; done
+              echo ""
+            fi
+            if [ "${#fix_shas[@]}" -gt 0 ]; then
+              echo "### 🐛 Fixes (${#fix_shas[@]})"
+              for entry in "${fix_shas[@]}"; do echo "- $entry"; done
+              echo ""
+            fi
+            if [ "${#chore_shas[@]}" -gt 0 ]; then
+              echo "<details><summary>🔧 Internal (${#chore_shas[@]})</summary>"
+              echo ""
+              for entry in "${chore_shas[@]}"; do echo "- $entry"; done
+              echo ""
+              echo "</details>"
+              echo ""
+            fi
+            if [ "${#unknown_shas[@]}" -gt 0 ]; then
+              echo "<details><summary>⚠️ Non-Conventional-Commit subjects (${#unknown_shas[@]})</summary>"
+              echo ""
+              for entry in "${unknown_shas[@]}"; do echo "- $entry"; done
+              echo ""
+              echo "</details>"
+              echo ""
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
-              **To tag:**
-              ```bash
-              git tag vX.Y.Z
-              git push origin vX.Y.Z
-              ```
-
-              <details>
-              <summary>Commits considered (${{ steps.log.outputs.count }})</summary>
-
-              <one bullet per commit, format: `- <subject> (<sha>)`>
-
-              </details>
-
-            Don't post a PR comment. Don't create a tag. Don't open an issue.
-            This is advisory output only — the developer reads the summary
-            and runs the tag command manually.
+          # Also log to stdout for the run log.
+          echo "Suggested: $next_version  (bump: $bump_label, $count commits since $prev_display)"
