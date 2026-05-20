@@ -71,7 +71,10 @@ jobs:
 
       - name: Post or update rolling issue
         env:
-          GH_TOKEN: ${{ secrets.ORG_READ_TOKEN }}
+          # Use the workflow's built-in token, not ORG_READ_TOKEN. The PAT is
+          # scoped read-only for cross-repo branch listing; GITHUB_TOKEN has
+          # issues:write on the repo where this workflow runs (.github).
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           TITLE="Stale branch tracker"
