@@ -41,33 +41,29 @@ jobs:
 
           echo "Found $(wc -l < stale.txt) stale branches"
 
-      - name: Format report with Claude
-        uses: anthropics/claude-code-action@beta
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          mode: agent
-          model: claude-haiku-4-5
-          direct_prompt: |
-            Read stale.txt. Each line is `repo,branch,age_days`. Group by repo
-            (alphabetical), sort within each repo by age descending.
+      - name: Format report
+        run: |
+          set -euo pipefail
+          TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-            Write the markdown to a file at ./report.md with this exact format:
+          if [ ! -s stale.txt ]; then
+            printf '_Last updated: %s_\n\nAll branches are fresh — no action needed.\n' "$TS" > report.md
+            exit 0
+          fi
 
-              _Last updated: <ISO timestamp>_
-
-              ## <repo>
-              - `<branch>` — <age> days old
-
-            Repeat the `## <repo>` block for each repo. If stale.txt is empty,
-            write only:
-
-              _Last updated: <ISO timestamp>_
-
-              All branches are fresh — no action needed.
-
-            Don't editorialise. Don't suggest deletions. Don't create or edit
-            any GitHub issues — a later step handles posting.
+          # Sort by repo (col 1) then by age descending (col 3, numeric).
+          # Then awk groups consecutive same-repo lines under a ## header.
+          {
+            printf '_Last updated: %s_\n\n' "$TS"
+            sort -t, -k1,1 -k3,3nr stale.txt | awk -F, '
+              $1 != prev_repo {
+                if (prev_repo != "") print ""
+                print "## " $1
+                prev_repo = $1
+              }
+              { print "- `" $2 "` — " $3 " days old" }
+            '
+          } > report.md
 
       - name: Post or update rolling issue
         env:
