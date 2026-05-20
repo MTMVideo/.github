@@ -1,0 +1,59 @@
+name: Weekly stale branch report
+
+on:
+  schedule:
+    - cron: '0 9 * * MON'   # Mondays 09:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect stale branches across org
+        id: collect
+        env:
+          GH_TOKEN: ${{ secrets.ORG_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          THRESHOLD=$(date -u -d '30 days ago' +%s)
+          OUTPUT="stale.txt"
+          : > "$OUTPUT"
+
+          for repo in $(gh repo list MTMVideo --limit 200 --json name --jq '.[].name'); do
+            gh api "/repos/MTMVideo/$repo/branches?per_page=100" --paginate \
+              --jq '.[] | select(.name != "main" and (.name | startswith("studio-") | not)) | .name' \
+            | while read -r branch; do
+              commit_iso=$(gh api "/repos/MTMVideo/$repo/branches/$branch" --jq '.commit.commit.committer.date' 2>/dev/null || echo "")
+              [ -z "$commit_iso" ] && continue
+              commit_ts=$(date -u -d "$commit_iso" +%s)
+              if [ "$commit_ts" -lt "$THRESHOLD" ]; then
+                age_days=$(( ($(date -u +%s) - commit_ts) / 86400 ))
+                echo "$repo,$branch,$age_days" >> "$OUTPUT"
+              fi
+            done
+          done
+
+      - name: Summarise with Claude
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          model: claude-haiku-4-5
+          direct_prompt: |
+            Read stale.txt. Each line is `repo,branch,age_days`. Group by repo,
+            sort within each repo by age descending. Write a markdown summary
+            for a GitHub issue titled "Weekly stale branch report — <today>".
+
+            Format:
+            ## <repo>
+            - `<branch>` — <age> days old
+
+            If nothing is stale, write "All branches are fresh — no action
+            needed." Don't editorialise. Don't suggest deletions; the team
+            decides what to clean up.
+
+            Then open a GitHub issue in MTMVideo/.github with the summary.
