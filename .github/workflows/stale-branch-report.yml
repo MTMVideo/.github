@@ -39,37 +39,53 @@ jobs:
             exit 1
           fi
 
+          # GraphQL: fetch 100 branches + commit dates per request, paginated.
+          # ~100x faster than the previous per-branch REST loop.
+          read -r -d '' QUERY <<'EOF' || true
+          query($owner: String!, $name: String!, $endCursor: String) {
+            repository(owner: $owner, name: $name) {
+              refs(refPrefix: "refs/heads/", first: 100, after: $endCursor) {
+                pageInfo { hasNextPage endCursor }
+                nodes {
+                  name
+                  target {
+                    ... on Commit { committedDate }
+                  }
+                }
+              }
+            }
+          }
+          EOF
+
           for repo in "${REPOS[@]}"; do
-            # Pull all branches (paginated). Strip nothing here — we want to
-            # see the raw list before filtering.
-            mapfile -t ALL_BRANCHES < <(gh api "/repos/MTMVideo/$repo/branches?per_page=100" --paginate --jq '.[].name' 2>/dev/null || true)
+            # Pull all branches + commit dates in one paginated GraphQL call.
+            # Output is one TSV line per branch: <name>\t<committedDate>.
+            BRANCH_DATA=$(gh api graphql --paginate \
+              -F owner=MTMVideo -F name="$repo" \
+              -f query="$QUERY" \
+              --jq '.data.repository.refs.nodes[] | [.name, .target.committedDate] | @tsv' 2>/dev/null || true)
 
-            # Branches we actually evaluate for staleness. Tweak the regex
-            # below if your team uses different long-lived branch names.
-            mapfile -t CANDIDATES < <(printf '%s\n' "${ALL_BRANCHES[@]}" | grep -Ev '^(main|master|studio-dev|studio-stg|studio-uat|studio-prod)$' || true)
+            total=$(printf '%s\n' "$BRANCH_DATA" | grep -c . || true)
+            # Exclude long-lived branches.
+            FILTERED=$(printf '%s\n' "$BRANCH_DATA" | grep -Ev $'^(main|master|studio-dev|studio-stg|studio-uat|studio-prod)\t' || true)
+            eligible=$(printf '%s\n' "$FILTERED" | grep -c . || true)
 
-            echo "::group::$repo — ${#ALL_BRANCHES[@]} total branches, ${#CANDIDATES[@]} eligible"
+            echo "::group::$repo — $total total branches, $eligible eligible"
 
-            for branch in "${CANDIDATES[@]}"; do
+            stale_count=0
+            while IFS=$'\t' read -r branch commit_iso; do
               [ -z "$branch" ] && continue
-
-              commit_iso=$(gh api "/repos/MTMVideo/$repo/branches/$branch" --jq '.commit.commit.committer.date' 2>/dev/null || echo "")
-              if [ -z "$commit_iso" ]; then
-                echo "  ?  $branch (could not read commit date)"
-                continue
-              fi
-
+              [ -z "$commit_iso" ] && continue
               commit_ts=$(date -u -d "$commit_iso" +%s)
               age_days=$(( (NOW - commit_ts) / 86400 ))
-
               if [ "$commit_ts" -lt "$THRESHOLD" ]; then
                 echo "  ✗  $branch — $age_days days (stale)"
                 echo "$repo,$branch,$age_days" >> stale.txt
-              else
-                echo "  ✓  $branch — $age_days days (fresh)"
+                stale_count=$((stale_count + 1))
               fi
-            done
+            done <<< "$FILTERED"
 
+            [ "$stale_count" -eq 0 ] && echo "  (no stale branches)"
             echo "::endgroup::"
           done
 
