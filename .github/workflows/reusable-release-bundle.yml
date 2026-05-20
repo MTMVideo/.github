@@ -187,13 +187,19 @@ jobs:
           git commit -m "chore: update CHANGELOG for ${tag}"
           git push -u origin "$branch"
 
+          # Write the PR body to a file so we don't fight YAML's block
+          # indentation with a multi-line --body string.
+          pr_body=$(mktemp)
+          {
+            printf 'Auto-generated changelog entry for [`%s`](../../releases/tag/%s).\n\n' "$tag" "$tag"
+            printf 'Please review and merge.\n'
+          } > "$pr_body"
+
           gh pr create \
             --base main \
             --head "$branch" \
             --title "chore: update CHANGELOG for ${tag}" \
-            --body "Auto-generated changelog entry for [\`${tag}\`](../../releases/tag/${tag}).
-
-Please review and merge."
+            --body-file "$pr_body"
 
       # ────────────────────────────────────────────────────────────────
       # 3. Deployment checklist — direct Anthropic API → append to release
