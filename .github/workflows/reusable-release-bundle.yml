@@ -397,9 +397,23 @@ jobs:
           issue_body=$(mktemp)
           printf '%s\n' "$postmortem" > "$issue_body"
 
-          gh issue create \
-            --title "Post-mortem: $tag" \
-            --body-file "$issue_body" \
-            --label "post-mortem,incident"
-
-          echo "Post-mortem issue created for $tag."
+          # Try to create an issue. Falls back to the step summary if the
+          # repo has Issues disabled or labels missing — the post-mortem
+          # content is still surfaced, just in the workflow run instead.
+          if gh issue create \
+              --title "Post-mortem: $tag" \
+              --body-file "$issue_body" \
+              --label "post-mortem,incident" 2>/tmp/issue_err; then
+            echo "Post-mortem issue created for $tag."
+          else
+            echo "::warning::Could not create issue ($(cat /tmp/issue_err)). Writing post-mortem to step summary instead."
+            {
+              echo "## 📝 Post-mortem draft (issue creation failed)"
+              echo ""
+              echo "_Reason: $(cat /tmp/issue_err)_"
+              echo ""
+              echo "---"
+              echo ""
+              cat "$issue_body"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
