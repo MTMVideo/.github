@@ -265,3 +265,141 @@ jobs:
           gh release edit "$tag" --notes-file "$combined"
 
           echo "Checklist appended to release $tag."
+
+      # ────────────────────────────────────────────────────────────────
+      # 4. Hotfix post-mortem (conditional) — direct Anthropic API → issue
+      # Only runs when the tag is on a commit that came from a hotfix/*
+      # branch. Detection signals (any one suffices):
+      #   - Merge commit subject contains `hotfix/<TICKET>-...`
+      #   - PR title for the tagged commit starts with `hotfix:`
+      # ────────────────────────────────────────────────────────────────
+      - name: Detect hotfix and draft post-mortem
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.ctx.outputs.tag }}"
+          prev="${{ steps.ctx.outputs.prev }}"
+          range="${{ steps.ctx.outputs.range }}"
+
+          # Try to extract a hotfix branch name from recent merge commits.
+          hotfix_branch=""
+          ticket=""
+          for sha in $(git rev-list -n 5 "$tag" 2>/dev/null); do
+            subject=$(git log -1 --format='%s' "$sha")
+            # Match patterns like:
+            #   "Merge pull request #42 from MTMVideo/hotfix/MTM-1234-..."
+            #   "hotfix: token refresh fails (MTM-1234)"
+            candidate=$(printf '%s' "$subject" | grep -oE 'hotfix/[A-Z]+-[0-9]+-[a-z0-9.-]+' | head -1 || true)
+            if [ -n "$candidate" ]; then
+              hotfix_branch="$candidate"
+              ticket=$(printf '%s' "$candidate" | grep -oE '[A-Z]+-[0-9]+' | head -1)
+              break
+            fi
+            if printf '%s' "$subject" | grep -qE '^hotfix:'; then
+              hotfix_branch="(squashed)"
+              ticket=$(printf '%s' "$subject" | grep -oE '[A-Z]+-[0-9]+' | head -1 || echo "(unknown)")
+              break
+            fi
+          done
+
+          if [ -z "$hotfix_branch" ]; then
+            echo "Not a hotfix tag — skipping post-mortem."
+            exit 0
+          fi
+
+          echo "Hotfix tag detected. branch=$hotfix_branch ticket=$ticket"
+
+          # Reconstruct timeline data.
+          prev_tag_time=$(git log -1 --format='%aI' "$prev" 2>/dev/null || echo "(unknown)")
+          tag_time=$(git log -1 --format='%aI' "$tag" 2>/dev/null || echo "(unknown)")
+          duration_hours="?"
+          if [ "$prev_tag_time" != "(unknown)" ] && [ "$tag_time" != "(unknown)" ]; then
+            prev_s=$(date -u -d "$prev_tag_time" +%s 2>/dev/null || echo 0)
+            tag_s=$(date -u -d "$tag_time" +%s 2>/dev/null || echo 0)
+            [ "$prev_s" -gt 0 ] && [ "$tag_s" -gt 0 ] && duration_hours=$(( (tag_s - prev_s) / 3600 ))
+          fi
+
+          # Cap commit log + diff. The model only needs context, not the
+          # entire patch.
+          commits_summary=$(git log "$range" --format='- %h %s' 2>/dev/null | head -50 || true)
+          files_changed=$(git diff --name-only "$range" 2>/dev/null | head -50 || true)
+          diff_file=$(mktemp)
+          git diff "$range" 2>/dev/null | head -c 80000 > "$diff_file" || true
+
+          # Build the prompt. Strict markdown output (no JSON wrapping —
+          # the issue body is the entire response).
+          payload=$(mktemp)
+          jq -n \
+            --arg model "claude-haiku-4-5" \
+            --arg tag "$tag" \
+            --arg prev "$prev" \
+            --arg ticket "$ticket" \
+            --arg branch "$hotfix_branch" \
+            --arg duration "$duration_hours" \
+            --arg prev_time "$prev_tag_time" \
+            --arg tag_time "$tag_time" \
+            --arg commits "$commits_summary" \
+            --arg files "$files_changed" \
+            --arg diff "$(cat "$diff_file")" \
+            '{
+              model: $model,
+              max_tokens: 2048,
+              messages: [{
+                role: "user",
+                content: (
+                  "Draft a post-mortem for a production hotfix.\n\n" +
+                  "Repo: ${{ github.repository }}\n" +
+                  "Hotfix tag: " + $tag + "\n" +
+                  "Branched from prod tag: " + $prev + "\n" +
+                  "Ticket: " + $ticket + "\n" +
+                  "Hotfix branch: " + $branch + "\n" +
+                  "Prod tag " + $prev + " deployed at: " + $prev_time + "\n" +
+                  "Hotfix tag " + $tag + " released at: " + $tag_time + "\n" +
+                  "Duration broken in prod (hours): " + $duration + "\n\n" +
+                  "Commits in hotfix:\n" + $commits + "\n\n" +
+                  "Files changed:\n" + $files + "\n\n" +
+                  "Diff (capped):\n" + $diff + "\n\n" +
+                  "Write a post-mortem in this exact markdown structure, no preamble, no commentary outside the structure:\n\n" +
+                  "# Post-mortem: " + $tag + "\n\n" +
+                  "**Ticket:** " + $ticket + "  \n" +
+                  "**Branched from:** `" + $prev + "`  \n" +
+                  "**Hotfix tag:** `" + $tag + "`  \n" +
+                  "**Duration broken in prod:** ~" + $duration + " hours\n\n" +
+                  "## What broke\n_one paragraph inferring the symptom from the diff and commit messages. If unclear, write: \"Symptom not clear from diff alone — fill in manually.\"_\n\n" +
+                  "## Timeline\n- " + $prev_time + ": `" + $prev + "` deployed to production\n- " + $tag_time + ": `" + $tag + "` released as hotfix\n\n" +
+                  "## Root cause\n_one paragraph; if low-confidence, prefix with `(low confidence)` and list what would clarify it._\n\n" +
+                  "## Resolution\n_one paragraph describing what the fix does, based on the diff._\n\n" +
+                  "## Affected services\n_bullet list inferred from file paths. Map common paths to service names:_\n_- application/ → main application_\n_- if you cannot tell, write \"Unable to determine from diff.\"_\n\n" +
+                  "## Files touched\n_bullet list, max 20._\n\n" +
+                  "## Action items\n- [ ] Add regression test for the specific scenario\n- [ ] Schedule post-mortem meeting\n- [ ] _suggest 2-3 more based on the diff pattern; e.g. \"audit similar code paths in X\", \"add monitoring for Y\"_\n\n" +
+                  "Do not editorialise. Do not speculate beyond the diff. If you cannot infer something, say so explicitly."
+                )
+              }]
+            }' > "$payload"
+
+          response=$(mktemp)
+          http_code=$(curl -sS -o "$response" -w '%{http_code}' \
+            https://api.anthropic.com/v1/messages \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            --data-binary "@$payload")
+
+          if [ "$http_code" != "200" ]; then
+            echo "::warning::Anthropic API returned $http_code — skipping post-mortem draft"
+            cat "$response"
+            exit 0
+          fi
+
+          postmortem=$(jq -r '.content[0].text' < "$response")
+          issue_body=$(mktemp)
+          printf '%s\n' "$postmortem" > "$issue_body"
+
+          gh issue create \
+            --title "Post-mortem: $tag" \
+            --body-file "$issue_body" \
+            --label "post-mortem,incident"
+
+          echo "Post-mortem issue created for $tag."
