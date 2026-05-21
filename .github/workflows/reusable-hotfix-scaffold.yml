@@ -82,10 +82,7 @@ jobs:
           # Placeholder empty commit so a PR can be opened immediately
           # even when main and the prod tag point at the same SHA. The
           # squash-merge at the end of the hotfix workflow erases it.
-          git commit --allow-empty -m "chore: scaffold hotfix branch for ${{ inputs.ticket_id }}
-
-This placeholder commit lets the draft PR open. It will disappear when
-the hotfix is squash-merged."
+          git commit --allow-empty -m "chore: scaffold hotfix branch for ${{ inputs.ticket_id }} (placeholder commit, removed on squash-merge)"
 
           git push -u origin "$branch"
 
