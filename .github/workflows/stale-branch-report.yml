@@ -121,19 +121,64 @@ jobs:
             exit 0
           fi
 
-          # Sort by repo (col 1) then by age descending (col 3, numeric).
-          # Then awk groups consecutive same-repo lines under a ## header.
+          TOTAL=$(wc -l < stale.txt | tr -d ' ')
+
+          # Per-repo collapsible sections keep the issue scannable; summary
+          # table up top gives the at-a-glance count. Branches per repo are
+          # capped so one runaway repo can't blow the 65 536-char issue limit.
+          PER_REPO_CAP=50
+
           {
             printf '_Last updated: %s_\n\n' "$TS"
-            sort -t, -k1,1 -k3,3nr stale.txt | awk -F, '
+            printf '**%s stale branches across %s repos.** Full list attached as workflow artifact `stale-branches`.\n\n' \
+              "$TOTAL" "$(cut -d, -f1 stale.txt | sort -u | wc -l | tr -d ' ')"
+
+            printf '| Repo | Stale branches |\n|---|---:|\n'
+            cut -d, -f1 stale.txt | sort | uniq -c \
+              | sort -k1,1nr \
+              | awk '{ count=$1; $1=""; sub(/^ /,""); print "| " $0 " | " count " |" }'
+            printf '\n'
+
+            sort -t, -k1,1 -k3,3nr stale.txt | awk -F, -v cap="$PER_REPO_CAP" '
               $1 != prev_repo {
-                if (prev_repo != "") print ""
-                print "## " $1
+                if (prev_repo != "") {
+                  if (n > cap) printf("- _…and %d more, see artifact_\n", n - cap)
+                  print "</details>"
+                  print ""
+                }
+                printf("<details><summary><strong>%s</strong></summary>\n\n", $1)
                 prev_repo = $1
+                n = 0
               }
-              { print "- `" $2 "` — " $3 " days old" }
+              {
+                n++
+                if (n <= cap) print "- `" $2 "` — " $3 " days old"
+              }
+              END {
+                if (prev_repo != "") {
+                  if (n > cap) printf("- _…and %d more, see artifact_\n", n - cap)
+                  print "</details>"
+                }
+              }
             '
           } > report.md
+
+          # Hard safety net — issue body limit is 65 536 chars. If we somehow
+          # still exceed it, truncate and flag rather than fail the API call.
+          MAX=65000
+          if [ "$(wc -c < report.md)" -gt "$MAX" ]; then
+            head -c "$MAX" report.md > report.md.trunc
+            printf '\n\n_…report truncated to fit GitHub'\''s 65 536-char issue body limit. See workflow artifact for full list._\n' >> report.md.trunc
+            mv report.md.trunc report.md
+          fi
+
+      - name: Upload stale branch list
+        if: hashFiles('stale.txt') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: stale-branches
+          path: stale.txt
+          retention-days: 90
 
       - name: Delete stale branches (gated)
         if: github.event_name == 'workflow_dispatch' && inputs.delete_stale_branches == 'yes'
