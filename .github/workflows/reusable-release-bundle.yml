@@ -229,7 +229,7 @@ jobs:
           jq -n \
             --arg model "claude-sonnet-4-6" \
             --arg tag "$tag" \
-            --arg diff "$(cat "$diff_file")" \
+            --rawfile diff "$diff_file" \
             '{
               model: $model,
               max_tokens: 2048,
@@ -342,7 +342,7 @@ jobs:
             --arg tag_time "$tag_time" \
             --arg commits "$commits_summary" \
             --arg files "$files_changed" \
-            --arg diff "$(cat "$diff_file")" \
+            --rawfile diff "$diff_file" \
             '{
               model: $model,
               max_tokens: 2048,
