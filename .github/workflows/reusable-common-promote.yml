@@ -140,3 +140,41 @@ jobs:
           if [ "${{ inputs.skip_uat_check }}" = "true" ]; then
             echo "**⚠️ UAT check was skipped**" >> $GITHUB_STEP_SUMMARY
           fi
+
+  # Fires only when the promote job above fails, mirroring the Cloud Build ->
+  # Slack alert for dev/stg. Covers uat/prod image promotion for every service
+  # that calls this reusable workflow.
+  notify-failure:
+    needs: promote
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Slack on promotion failure
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          REPO: ${{ github.repository }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          VERSION: ${{ inputs.version }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          payload=$(jq -n \
+            --arg repo "$REPO" --arg env "$ENVIRONMENT" --arg version "$VERSION" \
+            --arg actor "$ACTOR" --arg run_url "$RUN_URL" \
+            '{
+              text: "🔴 Image promotion FAILURE — \($repo) (\($env))",
+              blocks: [
+                { type: "header", text: { type: "plain_text", text: "🔴 Image promotion FAILURE" } },
+                { type: "section", fields: [
+                  { type: "mrkdwn", text: "*Repo:*\n\($repo)" },
+                  { type: "mrkdwn", text: "*Env:*\n\($env)" },
+                  { type: "mrkdwn", text: "*Release tag:*\n\($version)" },
+                  { type: "mrkdwn", text: "*Triggered by:*\n\($actor)" },
+                  { type: "mrkdwn", text: "*Status:*\nFAILURE" }
+                ]},
+                { type: "actions", elements: [
+                  { type: "button", text: { type: "plain_text", text: "View workflow run" }, url: $run_url, style: "danger" }
+                ]}
+              ]
+            }')
+          curl -sf -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL"
