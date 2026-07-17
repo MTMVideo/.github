@@ -45,13 +45,13 @@ jobs:
               username: context.actor,
             });
             const allowed = ['admin', 'maintain'];
-            if (!allowed.includes(data.permission)) {
+            if (!allowed.includes(data.role_name)) {
               core.setFailed(
-                `🚫 ${context.actor} has permission '${data.permission}'. ` +
+                `🚫 ${context.actor} has role '${data.role_name}'. ` +
                 `Only maintainers and admins can promote images.`
               );
             } else {
-              core.info(`✅ ${context.actor} is authorized (${data.permission})`);
+              core.info(`✅ ${context.actor} is authorized (${data.role_name})`);
             }
 
       - name: Authenticate to GCP
