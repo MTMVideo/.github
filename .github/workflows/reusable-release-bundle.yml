@@ -60,7 +60,14 @@ jobs:
           breaking=$(mktemp); feat=$(mktemp); fix=$(mktemp)
           chore=$(mktemp);   docs=$(mktemp); other=$(mktemp)
 
-          while IFS=$'\t' read -r sha subject body; do
+          # NUL-delimited records (git log -z) so a multi-line commit body
+          # (%b) stays inside ONE record instead of each extra line being
+          # misread by `read` as its own record with an empty subject.
+          while IFS= read -r -d '' record; do
+            sha="${record%%$'\t'*}"
+            rest="${record#*$'\t'}"
+            subject="${rest%%$'\t'*}"
+            body="${rest#*$'\t'}"
             [ -z "$sha" ] && continue
             full="$subject"$'\n'"$body"
 
@@ -81,7 +88,7 @@ jobs:
             else
               echo "- $subject ($sha)" >> "$other"
             fi
-          done < <(git log "$range" --format='%h%x09%s%x09%b' 2>/dev/null || true)
+          done < <(git log -z "$range" --format='%h%x09%s%x09%b' 2>/dev/null || true)
 
           notes=$(mktemp)
           {
@@ -117,7 +124,13 @@ jobs:
           # Collect into Keep-a-Changelog buckets.
           added=$(mktemp); changed=$(mktemp); fixed=$(mktemp); removed=$(mktemp); breaking=$(mktemp)
 
-          while IFS=$'\t' read -r sha subject body; do
+          # Same NUL-delimited record parsing as the release-notes step above
+          # — see the comment there for why this matters for multi-line bodies.
+          while IFS= read -r -d '' record; do
+            sha="${record%%$'\t'*}"
+            rest="${record#*$'\t'}"
+            subject="${rest%%$'\t'*}"
+            body="${rest#*$'\t'}"
             [ -z "$sha" ] && continue
             full="$subject"$'\n'"$body"
             clean=$(printf '%s' "$subject" | sed -E 's/^[a-zA-Z]+(\([^)]+\))?!?: *//')
@@ -134,7 +147,7 @@ jobs:
             elif printf '%s' "$subject" | grep -qE '^revert(\([^)]+\))?:'; then
               echo "- $clean" >> "$removed"
             fi
-          done < <(git log "$range" --format='%h%x09%s%x09%b' 2>/dev/null || true)
+          done < <(git log -z "$range" --format='%h%x09%s%x09%b' 2>/dev/null || true)
 
           # Build new section (skip empty subsections).
           section=$(mktemp)
