@@ -39,7 +39,7 @@ jobs:
 
           commits_file=$(mktemp)
           git log "$range" --format='%h|%s|%b%x00' > "$commits_file" 2>/dev/null || true
-          count=$(grep -c '' "$commits_file" 2>/dev/null || echo 0)
+          count=$(wc -l < "$commits_file" | tr -d ' ')
 
           # ── 2. Short-circuit edge cases without calling Claude ────────
           if [ "$first_release" -eq 1 ]; then
